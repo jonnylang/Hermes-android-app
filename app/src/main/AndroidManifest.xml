@@ -16,6 +16,7 @@
         android:label="Hermes Voice"
         android:supportsRtl="true"
         android:theme="@style/Theme.HermesVoice"
+        android:usesCleartextTraffic="true"
         tools:targetApi="34">
 
         <activity

@@ -18,6 +18,7 @@ import com.nous.hermesvoice.data.SettingsRepository
 import com.nous.hermesvoice.net.HermesClient
 import com.nous.hermesvoice.tts.TtsManager
 import com.nous.hermesvoice.ui.MainActivity
+import com.nous.hermesvoice.util.AppLogger
 import com.nous.hermesvoice.vosk.VoskManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -37,8 +38,8 @@ import android.app.NotificationManager
  * Состояния голосового ассистента (state machine).
  */
 enum class VoiceState {
-    IDLE,           // Ожидание wake word
-    LISTENING,      // Запрос пользователя (свободная речь)
+    IDLE,           // Остановлен, ждёт нажатия кнопки
+    LISTENING,      // Запись голоса пользователя
     THINKING,       // Запрос к Hermes API
     SPEAKING,       // Озвучка ответа
     ERROR           // Ошибка
@@ -56,11 +57,11 @@ data class ChatMessage(
 /**
  * Главный foreground service.
  *
- * State machine:
- *   IDLE → (wake word detected) → LISTENING
- *   LISTENING → (silence / final result) → THINKING
- *   THINKING → (Hermes response) → SPEAKING
- *   SPEAKING → (TTS done) → IDLE
+ * State machine (кнопочный режим, без wake word):
+ *   IDLE → (нажали «Запустить») → LISTENING
+ *   LISTENING → (распознана речь) → THINKING
+ *   THINKING → (ответ от Hermes) → SPEAKING
+ *   SPEAKING → (TTS озвучил) → IDLE
  */
 class VoiceService : Service() {
 
@@ -96,18 +97,17 @@ class VoiceService : Service() {
             context = this,
             onPartialResult = { partial ->
                 if (_state.value == VoiceState.LISTENING && partial.isNotEmpty()) {
-                    Log.d(TAG, "Partial: $partial")
+                    AppLogger.d(TAG, "Partial: $partial")
                 }
             },
-            onFinalResult = { final ->
+            onFinalResultCb = { final ->
                 handleFinalResult(final)
             },
             onTimeout = {
-                Log.w(TAG, "Vosk timeout — restarting wake word mode")
+                AppLogger.w(TAG, "Vosk timeout — stopping listening")
                 scope.launch {
-                    mutex.withLock {
-                        vosk.startWakeWord(currentSettings?.wakeWord ?: "эй гермес")
-                    }
+                    mutex.withLock { vosk.stop() }
+                    transitionTo(VoiceState.IDLE)
                 }
             }
         )
@@ -115,25 +115,25 @@ class VoiceService : Service() {
         tts = TtsManager(this)
         tts.onDone = {
             if (_state.value == VoiceState.SPEAKING) {
-                Log.i(TAG, "TTS done → IDLE")
-                transitionTo(VoiceState.IDLE)
+                AppLogger.i(TAG, "TTS done → LISTENING again")
+                startListening()
             }
         }
 
-        // Загружаем настройки и стартуем
+        // Загружаем настройки и инициализируем
         scope.launch {
             val settings = settingsRepo.settings.first()
             currentSettings = settings
-            initAndStart(settings)
+            initService(settings)
         }
     }
 
-    private suspend fun initAndStart(settings: HermesSettings) {
+    private suspend fun initService(settings: HermesSettings) {
         // Инициализация Vosk
         val lang = settings.modelLang
         val ok = vosk.init(lang)
         if (!ok) {
-            Log.e(TAG, "Vosk init failed")
+            AppLogger.e(TAG, "Vosk init failed")
             transitionTo(VoiceState.ERROR)
             return
         }
@@ -141,24 +141,18 @@ class VoiceService : Service() {
         // Создаём Hermes-клиент
         hermesClient = HermesClient(settings.serverUrl, settings.apiKey)
 
-        // Стартуем wake word режим
-        startWakeWordMode(settings.wakeWord)
+        // Сразу начинаем слушать
+        startListening()
     }
 
-    private fun startWakeWordMode(wakeWord: String) {
-        transitionTo(VoiceState.IDLE)
-        Log.i(TAG, "Starting wake word mode: \"$wakeWord\"")
-
-        listenJob = scope.launch {
-            mutex.withLock {
-                vosk.startWakeWord(wakeWord)
-            }
-        }
-    }
-
-    private fun startListeningMode() {
+    /**
+     * Публичный метод — вызывается из UI при нажатии «Запустить».
+     * Начинает прослушивание в режиме свободной речи.
+     */
+    fun startListening() {
+        if (_state.value != VoiceState.IDLE) return
         transitionTo(VoiceState.LISTENING)
-        Log.i(TAG, "Starting free-form listening")
+        AppLogger.i(TAG, "Starting free-form listening")
 
         listenJob = scope.launch {
             mutex.withLock {
@@ -168,50 +162,42 @@ class VoiceService : Service() {
     }
 
     /**
+     * Обновляет настройки сервиса (URL, ключ, язык).
+     * Вызывается из UI после сохранения настроек.
+     */
+    fun updateSettings(settings: HermesSettings) {
+        currentSettings = settings
+        hermesClient = HermesClient(settings.serverUrl, settings.apiKey)
+        AppLogger.i(TAG, "Settings updated: server=${settings.serverUrl}, lang=${settings.modelLang}")
+    }
+
+    /**
      * Обработка финального результата распознавания.
-     * В wake word режиме — переход к listening.
-     * В listening режиме — отправка запроса Hermes.
+     * В режиме LISTENING — отправка запроса Hermes.
      */
     private fun handleFinalResult(text: String) {
         if (text.isBlank()) return
 
         val state = _state.value
-        Log.i(TAG, "Final result [$state]: \"$text\"")
+        AppLogger.i(TAG, "Final result [$state]: \"$text\"")
 
-        when (state) {
-            VoiceState.IDLE -> {
-                // Проверяем wake word
-                val wakeWord = currentSettings?.wakeWord ?: "эй гермес"
-                if (text.contains(wakeWord)) {
-                    Log.i(TAG, "Wake word detected → LISTENING")
-                    // Короткий звуковой сигнал / вибрация (TODO)
-                    startListeningMode()
-                } else {
-                    // Перезапускаем wake word режим
-                    scope.launch { mutex.withLock { vosk.startWakeWord(wakeWord) } }
+        if (state == VoiceState.LISTENING) {
+            if (text.isNotBlank() && text.length > 1) {
+                AppLogger.i(TAG, "Recognized text, sending to Hermes")
+                // Добавляем в лог
+                _messages.value = _messages.value + ChatMessage("user", text)
+                // Останавливаем Vosk
+                vosk.stop()
+                // Отправляем Hermes
+                sendToHermes(text)
+            } else {
+                AppLogger.w(TAG, "Empty/too short result, stopping")
+                // Пустой результат — останавливаемся
+                scope.launch {
+                    mutex.withLock { vosk.stop() }
+                    transitionTo(VoiceState.IDLE)
                 }
             }
-
-            VoiceState.LISTENING -> {
-                // Это запрос пользователя
-                if (text.isNotBlank() && text.length > 1) {
-                    // Добавляем в лог
-                    _messages.value = _messages.value + ChatMessage("user", text)
-                    // Останавливаем Vosk
-                    vosk.stop()
-                    // Отправляем Hermes
-                    sendToHermes(text)
-                } else {
-                    // Пустой результат — возвращаемся к wake word
-                    scope.launch {
-                        mutex.withLock {
-                            vosk.startWakeWord(currentSettings?.wakeWord ?: "эй гермес")
-                        }
-                    }
-                }
-            }
-
-            else -> { /* игнорируем */ }
         }
     }
 
@@ -235,28 +221,23 @@ class VoiceService : Service() {
                     _messages.value = _messages.value + ChatMessage("assistant", fullResponse)
                 }
 
-                Log.i(TAG, "Hermes response: ${fullResponse.take(100)}…")
+                AppLogger.i(TAG, "Hermes response: ${fullResponse.take(100)}…")
 
             } catch (e: Exception) {
-                Log.e(TAG, "Hermes request failed", e)
+                AppLogger.e(TAG, "Hermes request failed: ${e.message}")
                 _messages.value = _messages.value + ChatMessage("assistant", "Ошибка: ${e.message}")
                 tts.speak("Произошла ошибка при обращении к серверу.")
                 transitionTo(VoiceState.ERROR)
                 delay(2000)
-            }
-
-            // Возврат к wake word режиму
-            transitionTo(VoiceState.IDLE)
-            scope.launch {
-                mutex.withLock {
-                    vosk.startWakeWord(currentSettings?.wakeWord ?: "эй гермес")
-                }
+                // После ошибки — снова слушаем
+                transitionTo(VoiceState.IDLE)
+                startListening()
             }
         }
     }
 
     private fun transitionTo(newState: VoiceState) {
-        Log.d(TAG, "State: ${_state.value} → $newState")
+        AppLogger.d(TAG, "State: ${_state.value} → $newState")
         _state.value = newState
         updateNotification(newState)
     }
@@ -326,7 +307,6 @@ class VoiceService : Service() {
         private const val TAG = "VoiceService"
         private const val NOTIF_ID = 42
 
-        // Доступ к state flow из UI (через Service reference)
         fun start(context: Context) {
             val intent = Intent(context, VoiceService::class.java)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

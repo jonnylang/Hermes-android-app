@@ -2,6 +2,7 @@ package com.nous.hermesvoice.vosk
 
 import android.content.Context
 import android.util.Log
+import com.nous.hermesvoice.util.AppLogger
 import org.vosk.Model
 import org.vosk.Recognizer
 import org.vosk.android.SpeechService
@@ -29,13 +30,13 @@ object VoskModelLoader {
         val targetDir = File(context.filesDir, modelName)
 
         if (targetDir.exists() && File(targetDir, "am/mfcc.conf").exists()) {
-            Log.d(TAG, "Model already extracted: ${targetDir.absolutePath}")
+            AppLogger.d(TAG, "Model already extracted: ${targetDir.absolutePath}")
             return targetDir.absolutePath
         }
 
-        Log.i(TAG, "Extracting model $modelName from assets…")
+        AppLogger.i(TAG, "Extracting model $modelName from assets…")
         copyAssetFolder(context, "models/$modelName", targetDir)
-        Log.i(TAG, "Model extracted to ${targetDir.absolutePath}")
+        AppLogger.i(TAG, "Model extracted to ${targetDir.absolutePath}")
         return targetDir.absolutePath
     }
 
@@ -60,7 +61,7 @@ object VoskModelLoader {
                         }
                     }
                 } catch (e: IOException) {
-                    Log.e(TAG, "Failed to copy $itemPath", e)
+                    AppLogger.e(TAG, "Failed to copy $itemPath: ${e.message}")
                 }
             }
         }
@@ -80,7 +81,7 @@ object VoskModelLoader {
 class VoskManager(
     private val context: Context,
     private val onPartialResult: (String) -> Unit,
-    private val onFinalResult: (String) -> Unit,
+    private val onFinalResultCb: (String) -> Unit,
     private val onTimeout: () -> Unit = {}
 ) {
     private var model: Model? = null
@@ -91,10 +92,12 @@ class VoskManager(
     fun init(lang: String): Boolean {
         return try {
             val modelPath = VoskModelLoader.ensureModel(context, lang)
+            AppLogger.i(TAG, "Loading Vosk model from: $modelPath")
             model = Model(modelPath)
+            AppLogger.i(TAG, "Vosk model loaded successfully")
             true
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to init Vosk model", e)
+            AppLogger.e(TAG, "Failed to init Vosk model: ${e.message}")
             false
         }
     }
@@ -122,47 +125,67 @@ class VoskManager(
             stop()
 
             val m = model ?: run {
-                Log.e(TAG, "Model not initialized — call init() first")
+                AppLogger.e(TAG, "Model not initialized — call init() first")
                 return false
             }
 
+            AppLogger.d(TAG, "Creating Recognizer (grammar=${grammar != null}, sampleRate=$sampleRate)")
             recognizer = if (grammar != null) {
                 Recognizer(m, sampleRate.toFloat(), grammar)
             } else {
                 Recognizer(m, sampleRate.toFloat())
             }
 
+            AppLogger.d(TAG, "Creating SpeechService")
             speechService = SpeechService(recognizer, sampleRate.toFloat())
 
+            AppLogger.d(TAG, "Starting listening…")
             speechService?.startListening(object : org.vosk.android.RecognitionListener {
                 override fun onPartialResult(hypothesis: String) {
+                    AppLogger.d(TAG, "onPartialResult: $hypothesis")
                     val text = parseResult(hypothesis, "partial")
-                    if (text.isNotEmpty()) onPartialResult(text)
+                    if (text.isNotEmpty()) {
+                        AppLogger.d(TAG, "Partial text: \"$text\"")
+                        onPartialResult(text)
+                    }
                 }
 
                 override fun onResult(hypothesis: String) {
+                    AppLogger.d(TAG, "onResult: $hypothesis")
                     val text = parseResult(hypothesis, "text")
-                    if (text.isNotEmpty()) onFinalResult(text)
+                    if (text.isNotEmpty()) {
+                        AppLogger.i(TAG, "Final text: \"$text\"")
+                        onFinalResultCb(text)
+                    } else {
+                        AppLogger.w(TAG, "onResult with empty text")
+                    }
                 }
 
                 override fun onFinalResult(hypothesis: String) {
+                    AppLogger.d(TAG, "onFinalResult: $hypothesis")
                     val text = parseResult(hypothesis, "text")
-                    if (text.isNotEmpty()) onFinalResult(text)
+                    if (text.isNotEmpty()) {
+                        AppLogger.i(TAG, "Final text: \"$text\"")
+                        onFinalResultCb(text)
+                    } else {
+                        AppLogger.w(TAG, "onFinalResult with empty text")
+                    }
                 }
 
                 override fun onError(exception: Exception) {
-                    Log.e(TAG, "Vosk error", exception)
+                    AppLogger.e(TAG, "Vosk error: ${exception.message}")
                 }
 
                 override fun onTimeout() {
-                    Log.d(TAG, "Vosk timeout — notifying listener")
+                    AppLogger.w(TAG, "Vosk timeout — notifying listener")
                     onTimeout()
                 }
             })
 
+            AppLogger.i(TAG, "Listening started successfully")
             true
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to start Vosk", e)
+            AppLogger.e(TAG, "Failed to start Vosk: ${e.message}")
             false
         }
     }

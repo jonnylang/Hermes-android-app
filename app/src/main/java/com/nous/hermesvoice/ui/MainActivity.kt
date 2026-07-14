@@ -1,6 +1,8 @@
 package com.nous.hermesvoice.ui
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -9,12 +11,14 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -28,9 +32,11 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.nous.hermesvoice.data.HermesSettings
 import com.nous.hermesvoice.data.SettingsRepository
+import com.nous.hermesvoice.net.HermesClient
 import com.nous.hermesvoice.service.ChatMessage
 import com.nous.hermesvoice.service.VoiceService
 import com.nous.hermesvoice.service.VoiceState
+import com.nous.hermesvoice.util.AppLogger
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 
@@ -76,12 +82,22 @@ class MainActivity : ComponentActivity() {
 
         var serviceRunning by remember { mutableStateOf(false) }
         var showSettings by remember { mutableStateOf(false) }
+        var showLogs by remember { mutableStateOf(false) }
 
         // Подписка на state и messages из VoiceService
-        val serviceState by (voiceService?.state ?: MutableStateFlow(VoiceState.IDLE))
-            .collectAsStateWithLifecycle(initialValue = VoiceState.IDLE)
-        val messages by (voiceService?.messages ?: MutableStateFlow(emptyList()))
-            .collectAsStateWithLifecycle(initialValue = emptyList())
+        // Используем produceState с ключом voiceService — переподписывается при bind
+        val serviceState by produceState<VoiceState>(
+            initialValue = VoiceState.IDLE,
+            key1 = voiceService
+        ) {
+            voiceService?.state?.collect { value = it }
+        }
+        val messages by produceState<List<ChatMessage>>(
+            initialValue = emptyList(),
+            key1 = voiceService
+        ) {
+            voiceService?.messages?.collect { value = it }
+        }
 
         MaterialTheme(
             colorScheme = darkColorScheme()
@@ -98,23 +114,31 @@ class MainActivity : ComponentActivity() {
                             "Hermes Voice",
                             style = MaterialTheme.typography.headlineMedium
                         )
-                        IconButton(onClick = { showSettings = !showSettings }) {
-                            Icon(Icons.Default.Settings, contentDescription = "Настройки")
+                        if (!showSettings && !showLogs) {
+                            Row {
+                                IconButton(onClick = { showLogs = true }) {
+                                    Icon(Icons.Default.BugReport, contentDescription = "Логи")
+                                }
+                                IconButton(onClick = { showSettings = true }) {
+                                    Icon(Icons.Default.Settings, contentDescription = "Настройки")
+                                }
+                            }
                         }
                     }
 
-                    if (showSettings) {
-                        SettingsPanel(
+                    when {
+                        showLogs -> LogsPanel(onBack = { showLogs = false })
+                        showSettings -> SettingsPanel(
                             settings = settings,
                             onSave = { newSettings ->
                                 scope.launch {
                                     settingsRepo.update { newSettings }
+                                    voiceService?.updateSettings(newSettings)
                                 }
-                            }
+                            },
+                            onBack = { showSettings = false }
                         )
-                    } else {
-                        // Main content
-                        MainContent(
+                        else -> MainContent(
                             settings = settings,
                             serviceRunning = serviceRunning,
                             serviceState = serviceState,
@@ -142,6 +166,93 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
+    private fun LogsPanel(onBack: () -> Unit) {
+        val logEntries = remember { mutableStateListOf<AppLogger.LogEntry>() }
+        val listState = rememberLazyListState()
+        val context = LocalContext.current
+
+        // Обновляем список логов каждые 2 секунды
+        LaunchedEffect(Unit) {
+            while (true) {
+                logEntries.clear()
+                logEntries.addAll(AppLogger.getEntries())
+                kotlinx.coroutines.delay(2000)
+            }
+        }
+
+        Column(
+            modifier = Modifier.fillMaxSize(),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            // Header
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Логи", style = MaterialTheme.typography.headlineSmall)
+                Row {
+                    // Кнопка "Копировать всё"
+                    IconButton(onClick = {
+                        val text = AppLogger.getEntries().joinToString("\n") { entry ->
+                            "[${entry.timestamp}] [${entry.level}] [${entry.tag}] ${entry.message}"
+                        }
+                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        clipboard.setPrimaryClip(ClipData.newPlainText("Hermes Logs", text))
+                        Toast.makeText(context, "Логи скопированы", Toast.LENGTH_SHORT).show()
+                    }) {
+                        Icon(Icons.Default.ContentCopy, contentDescription = "Копировать логи")
+                    }
+                    // Кнопка "Очистить"
+                    IconButton(onClick = {
+                        AppLogger.clear()
+                        logEntries.clear()
+                    }) {
+                        Icon(Icons.Default.DeleteSweep, contentDescription = "Очистить логи")
+                    }
+                    // Кнопка "Назад"
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.Default.Close, contentDescription = "Закрыть")
+                    }
+                }
+            }
+
+            // Список логов
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.fillMaxSize(),
+                verticalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
+                if (logEntries.isEmpty()) {
+                    item {
+                        Text(
+                            "Логов пока нет",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(16.dp)
+                        )
+                    }
+                } else {
+                    items(logEntries) { entry ->
+                        val color = when (entry.level) {
+                            "E" -> MaterialTheme.colorScheme.error
+                            "W" -> MaterialTheme.colorScheme.tertiary
+                            "I" -> MaterialTheme.colorScheme.primary
+                            else -> MaterialTheme.colorScheme.onSurfaceVariant
+                        }
+                        Text(
+                            text = "[${entry.timestamp}] [${entry.level}] [${entry.tag}] ${entry.message}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = color,
+                            modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    @Composable
     private fun MainContent(
         settings: HermesSettings,
         serviceRunning: Boolean,
@@ -161,25 +272,19 @@ class MainActivity : ComponentActivity() {
             // Status indicator
             StatusCard(serviceRunning = serviceRunning, serviceState = serviceState)
 
-            // Start/Stop button
+            // Start/Stop button — одно нажатие: запуск + сразу слушать
+            val buttonLabel = if (serviceRunning) "Остановить" else "Запустить"
+            val buttonIcon = if (serviceRunning) Icons.Default.Stop else Icons.Default.Mic
+            val buttonColor = if (serviceRunning) MaterialTheme.colorScheme.error
+                              else MaterialTheme.colorScheme.primary
             Button(
                 onClick = onToggleService,
                 modifier = Modifier.fillMaxWidth().height(56.dp),
-                colors = if (serviceRunning) {
-                    ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
-                } else {
-                    ButtonDefaults.buttonColors()
-                }
+                colors = ButtonDefaults.buttonColors(containerColor = buttonColor)
             ) {
-                Icon(
-                    if (serviceRunning) Icons.Default.Stop else Icons.Default.Mic,
-                    contentDescription = null
-                )
+                Icon(buttonIcon, contentDescription = null)
                 Spacer(Modifier.width(8.dp))
-                Text(
-                    if (serviceRunning) "Остановить" else "Запустить",
-                    style = MaterialTheme.typography.titleMedium
-                )
+                Text(buttonLabel, style = MaterialTheme.typography.titleMedium)
             }
 
             if (!permissionsGranted) {
@@ -197,7 +302,6 @@ class MainActivity : ComponentActivity() {
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text("Сервер: ${settings.serverUrl}", style = MaterialTheme.typography.bodySmall)
-                    Text("Wake word: «${settings.wakeWord}»", style = MaterialTheme.typography.bodySmall)
                     Text("Язык: ${if (settings.modelLang == "ru") "Русский" else "English"}",
                         style = MaterialTheme.typography.bodySmall)
                 }
@@ -253,7 +357,7 @@ class MainActivity : ComponentActivity() {
             serviceState == VoiceState.IDLE -> Triple(
                 MaterialTheme.colorScheme.surfaceVariant,
                 Icons.Default.Mic,
-                "Ожидание: «${currentSettings()?.wakeWord ?: "эй гермес"}»"
+                "Нажмите «Запустить» чтобы начать"
             )
             serviceState == VoiceState.LISTENING -> Triple(
                 MaterialTheme.colorScheme.tertiaryContainer,
@@ -298,23 +402,36 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun currentSettings(): HermesSettings? = voiceService?.currentSettings
-
     @Composable
     private fun SettingsPanel(
         settings: HermesSettings,
-        onSave: (HermesSettings) -> Unit
+        onSave: (HermesSettings) -> Unit,
+        onBack: () -> Unit
     ) {
         var serverUrl by remember { mutableStateOf(settings.serverUrl) }
         var apiKey by remember { mutableStateOf(settings.apiKey) }
-        var wakeWord by remember { mutableStateOf(settings.wakeWord) }
         var modelLang by remember { mutableStateOf(settings.modelLang) }
+
+        // Состояние теста соединения
+        var testResult by remember { mutableStateOf<String?>(null) }
+        var testInProgress by remember { mutableStateOf(false) }
+        val scope = rememberCoroutineScope()
 
         Column(
             modifier = Modifier.fillMaxWidth(),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            Text("Настройки", style = MaterialTheme.typography.headlineSmall)
+            // Header с кнопкой "Назад"
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Настройки", style = MaterialTheme.typography.headlineSmall)
+                IconButton(onClick = onBack) {
+                    Icon(Icons.Default.ArrowBack, contentDescription = "Назад")
+                }
+            }
 
             OutlinedTextField(
                 value = serverUrl,
@@ -331,14 +448,6 @@ class MainActivity : ComponentActivity() {
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true,
                 visualTransformation = PasswordVisualTransformation()
-            )
-
-            OutlinedTextField(
-                value = wakeWord,
-                onValueChange = { wakeWord = it.lowercase() },
-                label = { Text("Ключевая фраза") },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true
             )
 
             // Language selector
@@ -358,8 +467,53 @@ class MainActivity : ComponentActivity() {
                 )
             }
 
+            // Кнопка "Тест соединения"
             Button(
-                onClick = { onSave(HermesSettings(serverUrl, apiKey, wakeWord, modelLang)) },
+                onClick = {
+                    testInProgress = true
+                    testResult = null
+                    scope.launch {
+                        val client = HermesClient(serverUrl, apiKey)
+                        val result = client.testConnection()
+                        testResult = result
+                        testInProgress = false
+                    }
+                },
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !testInProgress
+            ) {
+                if (testInProgress) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(20.dp),
+                        strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.onPrimary
+                    )
+                    Spacer(Modifier.width(8.dp))
+                } else {
+                    Icon(Icons.Default.NetworkCheck, contentDescription = null)
+                    Spacer(Modifier.width(8.dp))
+                }
+                Text("Тест соединения")
+            }
+
+            // Результат теста
+            if (testResult != null) {
+                val isOk = testResult!!.startsWith("✅")
+                Text(
+                    testResult!!,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (isOk)
+                        MaterialTheme.colorScheme.primary
+                    else
+                        MaterialTheme.colorScheme.error
+                )
+            }
+
+            // Кнопка "Сохранить"
+            Button(
+                onClick = {
+                    onSave(HermesSettings(serverUrl, apiKey, "", modelLang))
+                },
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Icon(Icons.Default.Save, contentDescription = null)
