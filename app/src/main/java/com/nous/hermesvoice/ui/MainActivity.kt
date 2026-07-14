@@ -84,19 +84,16 @@ class MainActivity : ComponentActivity() {
         var showSettings by remember { mutableStateOf(false) }
         var showLogs by remember { mutableStateOf(false) }
 
-        // Подписка на state и messages из VoiceService
-        // Используем produceState с ключом voiceService — переподписывается при bind
-        val serviceState by produceState<VoiceState>(
-            initialValue = VoiceState.IDLE,
-            key1 = voiceService
-        ) {
-            voiceService?.state?.collect { value = it }
+        // Локальное состояние для UI — обновляем через LaunchedEffect
+        var serviceState by remember { mutableStateOf(VoiceState.IDLE) }
+        var messages by remember { mutableStateOf(emptyList<ChatMessage>()) }
+
+        // Подписываемся на state и messages из сервиса
+        LaunchedEffect(voiceService) {
+            voiceService?.state?.collect { serviceState = it }
         }
-        val messages by produceState<List<ChatMessage>>(
-            initialValue = emptyList(),
-            key1 = voiceService
-        ) {
-            voiceService?.messages?.collect { value = it }
+        LaunchedEffect(voiceService) {
+            voiceService?.messages?.collect { messages = it }
         }
 
         MaterialTheme(
@@ -104,7 +101,6 @@ class MainActivity : ComponentActivity() {
         ) {
             Surface(modifier = Modifier.fillMaxSize()) {
                 Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-                    // Header
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -171,7 +167,6 @@ class MainActivity : ComponentActivity() {
         val listState = rememberLazyListState()
         val context = LocalContext.current
 
-        // Обновляем список логов каждые 2 секунды
         LaunchedEffect(Unit) {
             while (true) {
                 logEntries.clear()
@@ -184,7 +179,6 @@ class MainActivity : ComponentActivity() {
             modifier = Modifier.fillMaxSize(),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            // Header
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -192,7 +186,6 @@ class MainActivity : ComponentActivity() {
             ) {
                 Text("Логи", style = MaterialTheme.typography.headlineSmall)
                 Row {
-                    // Кнопка "Копировать всё"
                     IconButton(onClick = {
                         val text = AppLogger.getEntries().joinToString("\n") { entry ->
                             "[${entry.timestamp}] [${entry.level}] [${entry.tag}] ${entry.message}"
@@ -203,21 +196,18 @@ class MainActivity : ComponentActivity() {
                     }) {
                         Icon(Icons.Default.ContentCopy, contentDescription = "Копировать логи")
                     }
-                    // Кнопка "Очистить"
                     IconButton(onClick = {
                         AppLogger.clear()
                         logEntries.clear()
                     }) {
                         Icon(Icons.Default.DeleteSweep, contentDescription = "Очистить логи")
                     }
-                    // Кнопка "Назад"
                     IconButton(onClick = onBack) {
                         Icon(Icons.Default.Close, contentDescription = "Закрыть")
                     }
                 }
             }
 
-            // Список логов
             LazyColumn(
                 state = listState,
                 modifier = Modifier.fillMaxSize(),
@@ -269,10 +259,8 @@ class MainActivity : ComponentActivity() {
         ) {
             Spacer(Modifier.height(24.dp))
 
-            // Status indicator
             StatusCard(serviceRunning = serviceRunning, serviceState = serviceState)
 
-            // Start/Stop button — одно нажатие: запуск + сразу слушать
             val buttonLabel = if (serviceRunning) "Остановить" else "Запустить"
             val buttonIcon = if (serviceRunning) Icons.Default.Stop else Icons.Default.Mic
             val buttonColor = if (serviceRunning) MaterialTheme.colorScheme.error
@@ -298,7 +286,6 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            // Server info
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text("Сервер: ${settings.serverUrl}", style = MaterialTheme.typography.bodySmall)
@@ -307,7 +294,6 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            // Chat log
             Text("История диалога:", style = MaterialTheme.typography.titleSmall)
             LazyColumn(
                 modifier = Modifier.weight(1f).fillMaxWidth(),
@@ -412,7 +398,6 @@ class MainActivity : ComponentActivity() {
         var apiKey by remember { mutableStateOf(settings.apiKey) }
         var modelLang by remember { mutableStateOf(settings.modelLang) }
 
-        // Состояние теста соединения
         var testResult by remember { mutableStateOf<String?>(null) }
         var testInProgress by remember { mutableStateOf(false) }
         val scope = rememberCoroutineScope()
@@ -421,7 +406,6 @@ class MainActivity : ComponentActivity() {
             modifier = Modifier.fillMaxWidth(),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            // Header с кнопкой "Назад"
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -450,7 +434,6 @@ class MainActivity : ComponentActivity() {
                 visualTransformation = PasswordVisualTransformation()
             )
 
-            // Language selector
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -467,7 +450,6 @@ class MainActivity : ComponentActivity() {
                 )
             }
 
-            // Кнопка "Тест соединения"
             Button(
                 onClick = {
                     testInProgress = true
@@ -496,20 +478,16 @@ class MainActivity : ComponentActivity() {
                 Text("Тест соединения")
             }
 
-            // Результат теста
             if (testResult != null) {
                 val isOk = testResult!!.startsWith("✅")
                 Text(
                     testResult!!,
                     style = MaterialTheme.typography.bodySmall,
-                    color = if (isOk)
-                        MaterialTheme.colorScheme.primary
-                    else
-                        MaterialTheme.colorScheme.error
+                    color = if (isOk) MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.error
                 )
             }
 
-            // Кнопка "Сохранить"
             Button(
                 onClick = {
                     onSave(HermesSettings(serverUrl, apiKey, "", modelLang))

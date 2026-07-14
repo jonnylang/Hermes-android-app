@@ -34,35 +34,20 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import android.app.NotificationManager
 
-/**
- * Состояния голосового ассистента (state machine).
- */
 enum class VoiceState {
-    IDLE,           // Остановлен, ждёт нажатия кнопки
-    LISTENING,      // Запись голоса пользователя
-    THINKING,       // Запрос к Hermes API
-    SPEAKING,       // Озвучка ответа
-    ERROR           // Ошибка
+    IDLE,
+    LISTENING,
+    THINKING,
+    SPEAKING,
+    ERROR
 }
 
-/**
- * Сообщение в логе диалога (для UI).
- */
 data class ChatMessage(
-    val role: String,   // "user" | "assistant"
+    val role: String,
     val text: String,
     val timestamp: Long = System.currentTimeMillis()
 )
 
-/**
- * Главный foreground service.
- *
- * State machine (кнопочный режим, без wake word):
- *   IDLE → (нажали «Запустить») → LISTENING
- *   LISTENING → (распознана речь) → THINKING
- *   THINKING → (ответ от Hermes) → SPEAKING
- *   SPEAKING → (TTS озвучил) → IDLE
- */
 class VoiceService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -72,7 +57,6 @@ class VoiceService : Service() {
     private var hermesClient: HermesClient? = null
     private val mutex = Mutex()
 
-    // State machine — доступно из UI через Companion
     private val _state = MutableStateFlow(VoiceState.IDLE)
     val state: StateFlow<VoiceState> = _state
 
@@ -86,10 +70,9 @@ class VoiceService : Service() {
     override fun onCreate() {
         super.onCreate()
 
-        // WakeLock — чтобы CPU не засыпал при выключенном экране
         val pm = getSystemService(POWER_SERVICE) as PowerManager
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "HermesVoice::WakeLock")
-        wakeLock?.acquire(12 * 60 * 60 * 1000L) // 12 часов
+        wakeLock?.acquire(12 * 60 * 60 * 1000L)
 
         settingsRepo = SettingsRepository(this)
 
@@ -104,24 +87,28 @@ class VoiceService : Service() {
                 handleFinalResult(final)
             },
             onTimeout = {
-                AppLogger.w(TAG, "Vosk timeout — stopping listening")
+                AppLogger.w(TAG, "Vosk timeout — restarting")
                 scope.launch {
                     mutex.withLock { vosk.stop() }
                     transitionTo(VoiceState.IDLE)
+                    startListening()
                 }
             }
         )
 
         tts = TtsManager(this)
         tts.onDone = {
-            if (_state.value == VoiceState.SPEAKING) {
-                AppLogger.i(TAG, "TTS done → IDLE → LISTENING")
-                transitionTo(VoiceState.IDLE)
-                startListening()
+            AppLogger.i(TAG, "TTS onDone called, state=${_state.value}")
+            // onDone может вызываться из любого потока, переключаемся на scope
+            scope.launch {
+                if (_state.value == VoiceState.SPEAKING) {
+                    AppLogger.i(TAG, "TTS done → restart listening")
+                    transitionTo(VoiceState.IDLE)
+                    startListening()
+                }
             }
         }
 
-        // Загружаем настройки и инициализируем
         scope.launch {
             val settings = settingsRepo.settings.first()
             currentSettings = settings
@@ -130,7 +117,6 @@ class VoiceService : Service() {
     }
 
     private suspend fun initService(settings: HermesSettings) {
-        // Инициализация Vosk
         val lang = settings.modelLang
         val ok = vosk.init(lang)
         if (!ok) {
@@ -139,19 +125,15 @@ class VoiceService : Service() {
             return
         }
 
-        // Создаём Hermes-клиент
         hermesClient = HermesClient(settings.serverUrl, settings.apiKey)
-
-        // Сразу начинаем слушать
         startListening()
     }
 
-    /**
-     * Публичный метод — вызывается из UI при нажатии «Запустить».
-     * Начинает прослушивание в режиме свободной речи.
-     */
     fun startListening() {
-        if (_state.value != VoiceState.IDLE) return
+        if (_state.value != VoiceState.IDLE) {
+            AppLogger.w(TAG, "startListening ignored: state=${_state.value}")
+            return
+        }
         transitionTo(VoiceState.LISTENING)
         AppLogger.i(TAG, "Starting free-form listening")
 
@@ -162,20 +144,12 @@ class VoiceService : Service() {
         }
     }
 
-    /**
-     * Обновляет настройки сервиса (URL, ключ, язык).
-     * Вызывается из UI после сохранения настроек.
-     */
     fun updateSettings(settings: HermesSettings) {
         currentSettings = settings
         hermesClient = HermesClient(settings.serverUrl, settings.apiKey)
         AppLogger.i(TAG, "Settings updated: server=${settings.serverUrl}, lang=${settings.modelLang}")
     }
 
-    /**
-     * Обработка финального результата распознавания.
-     * В режиме LISTENING — отправка запроса Hermes.
-     */
     private fun handleFinalResult(text: String) {
         if (text.isBlank()) return
 
@@ -185,18 +159,15 @@ class VoiceService : Service() {
         if (state == VoiceState.LISTENING) {
             if (text.isNotBlank() && text.length > 1) {
                 AppLogger.i(TAG, "Recognized text, sending to Hermes")
-                // Добавляем в лог
                 _messages.value = _messages.value + ChatMessage("user", text)
-                // Останавливаем Vosk
                 vosk.stop()
-                // Отправляем Hermes
                 sendToHermes(text)
             } else {
-                AppLogger.w(TAG, "Empty/too short result, stopping")
-                // Пустой результат — останавливаемся
+                AppLogger.w(TAG, "Empty/too short result, restarting")
                 scope.launch {
                     mutex.withLock { vosk.stop() }
                     transitionTo(VoiceState.IDLE)
+                    startListening()
                 }
             }
         }
@@ -210,14 +181,12 @@ class VoiceService : Service() {
             try {
                 val client = hermesClient ?: throw Exception("Hermes client not initialized")
 
-                // Streaming-режим: озвучиваем по предложениям
                 transitionTo(VoiceState.SPEAKING)
                 val fullResponse = client.chatStream(prompt) { token ->
                     tts.feedToken(token)
                 }
                 tts.flush()
 
-                // Добавляем ответ в лог
                 if (fullResponse.isNotBlank()) {
                     _messages.value = _messages.value + ChatMessage("assistant", fullResponse)
                 }
@@ -230,7 +199,6 @@ class VoiceService : Service() {
                 tts.speak("Произошла ошибка при обращении к серверу.")
                 transitionTo(VoiceState.ERROR)
                 delay(2000)
-                // После ошибки — снова слушаем
                 transitionTo(VoiceState.IDLE)
                 startListening()
             }
@@ -242,8 +210,6 @@ class VoiceService : Service() {
         _state.value = newState
         updateNotification(newState)
     }
-
-    // =================== Notification ===================
 
     private fun createNotification(state: VoiceState): Notification {
         val text = when (state) {
@@ -275,8 +241,6 @@ class VoiceService : Service() {
         nm.notify(NOTIF_ID, createNotification(state))
     }
 
-    // =================== Binder (для UI) ===================
-
     private val binder = LocalBinder()
 
     inner class LocalBinder : Binder() {
@@ -284,8 +248,6 @@ class VoiceService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
-
-    // =================== Lifecycle ===================
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForeground(NOTIF_ID, createNotification(VoiceState.IDLE))
@@ -301,8 +263,6 @@ class VoiceService : Service() {
         scope.cancel()
         super.onDestroy()
     }
-
-    // =================== Companion (для UI) ===================
 
     companion object {
         private const val TAG = "VoiceService"
