@@ -397,6 +397,8 @@ class MainActivity : ComponentActivity() {
         var serverUrl by remember { mutableStateOf(settings.serverUrl) }
         var apiKey by remember { mutableStateOf(settings.apiKey) }
         var modelLang by remember { mutableStateOf(settings.modelLang) }
+        var sttProvider by remember { mutableStateOf(settings.sttProvider) }
+        var ttsProvider by remember { mutableStateOf(settings.ttsProvider) }
 
         var testResult by remember { mutableStateOf<String?>(null) }
         var testInProgress by remember { mutableStateOf(false) }
@@ -434,6 +436,7 @@ class MainActivity : ComponentActivity() {
                 visualTransformation = PasswordVisualTransformation()
             )
 
+            // Language selector
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -450,6 +453,43 @@ class MainActivity : ComponentActivity() {
                 )
             }
 
+            // STT Provider
+            Text("Распознавание речи (STT):", style = MaterialTheme.typography.labelMedium)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                FilterChip(
+                    selected = sttProvider == "google",
+                    onClick = { sttProvider = "google" },
+                    label = { Text("Google (рекомендуется)") }
+                )
+                FilterChip(
+                    selected = sttProvider == "vosk",
+                    onClick = { sttProvider = "vosk" },
+                    label = { Text("Vosk (оффлайн)") }
+                )
+            }
+
+            // TTS Provider
+            Text("Озвучка (TTS):", style = MaterialTheme.typography.labelMedium)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                FilterChip(
+                    selected = ttsProvider == "edge",
+                    onClick = { ttsProvider = "edge" },
+                    label = { Text("Edge TTS (рекомендуется)") }
+                )
+                FilterChip(
+                    selected = ttsProvider == "android",
+                    onClick = { ttsProvider = "android" },
+                    label = { Text("Android TTS") }
+                )
+            }
+
+            // Connection test
             Button(
                 onClick = {
                     testInProgress = true
@@ -490,7 +530,7 @@ class MainActivity : ComponentActivity() {
 
             Button(
                 onClick = {
-                    onSave(HermesSettings(serverUrl, apiKey, "", modelLang))
+                    onSave(HermesSettings(serverUrl, apiKey, modelLang, sttProvider, ttsProvider))
                 },
                 modifier = Modifier.fillMaxWidth()
             ) {

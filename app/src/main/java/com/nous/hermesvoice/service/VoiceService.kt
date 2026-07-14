@@ -16,6 +16,8 @@ import com.nous.hermesvoice.R
 import com.nous.hermesvoice.data.HermesSettings
 import com.nous.hermesvoice.data.SettingsRepository
 import com.nous.hermesvoice.net.HermesClient
+import com.nous.hermesvoice.stt.GoogleSttManager
+import com.nous.hermesvoice.tts.EdgeTtsManager
 import com.nous.hermesvoice.tts.TtsManager
 import com.nous.hermesvoice.ui.MainActivity
 import com.nous.hermesvoice.util.AppLogger
@@ -52,8 +54,10 @@ class VoiceService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private lateinit var settingsRepo: SettingsRepository
-    private lateinit var vosk: VoskManager
-    private lateinit var tts: TtsManager
+    private var vosk: VoskManager? = null
+    private var googleStt: GoogleSttManager? = null
+    private var androidTts: TtsManager? = null
+    private var edgeTts: EdgeTtsManager? = null
     private var hermesClient: HermesClient? = null
     private val mutex = Mutex()
 
@@ -76,37 +80,36 @@ class VoiceService : Service() {
 
         settingsRepo = SettingsRepository(this)
 
+        // Инициализируем все менеджеры
         vosk = VoskManager(
             context = this,
             onPartialResult = { partial ->
                 if (_state.value == VoiceState.LISTENING && partial.isNotEmpty()) {
-                    AppLogger.d(TAG, "Partial: $partial")
+                    AppLogger.d(TAG, "Vosk partial: $partial")
                 }
             },
-            onFinalResultCb = { final ->
-                handleFinalResult(final)
-            },
-            onTimeout = {
-                AppLogger.w(TAG, "Vosk timeout — restarting")
-                scope.launch {
-                    mutex.withLock { vosk.stop() }
-                    transitionTo(VoiceState.IDLE)
-                    startListening()
-                }
-            }
+            onFinalResultCb = { final -> handleFinalResult(final) },
+            onTimeout = { onSttTimeout() }
         )
 
-        tts = TtsManager(this)
-        tts.onDone = {
-            AppLogger.i(TAG, "TTS onDone called, state=${_state.value}")
-            // onDone может вызываться из любого потока, переключаемся на scope
-            scope.launch {
-                if (_state.value == VoiceState.SPEAKING) {
-                    AppLogger.i(TAG, "TTS done → restart listening")
+        googleStt = GoogleSttManager(this).apply {
+            onResult = { text -> handleFinalResult(text) }
+            onTimeout = { onSttTimeout() }
+            onError = { msg ->
+                AppLogger.e(TAG, "Google STT error: $msg")
+                scope.launch {
                     transitionTo(VoiceState.IDLE)
                     startListening()
                 }
             }
+        }
+
+        androidTts = TtsManager(this).apply {
+            onDone = { onTtsDone() }
+        }
+
+        edgeTts = EdgeTtsManager().apply {
+            onDone = { onTtsDone() }
         }
 
         scope.launch {
@@ -116,11 +119,34 @@ class VoiceService : Service() {
         }
     }
 
+    private fun onTtsDone() {
+        AppLogger.i(TAG, "TTS done, state=${_state.value}")
+        scope.launch {
+            if (_state.value == VoiceState.SPEAKING) {
+                AppLogger.i(TAG, "TTS done → restart listening")
+                transitionTo(VoiceState.IDLE)
+                startListening()
+            }
+        }
+    }
+
+    private fun onSttTimeout() {
+        AppLogger.w(TAG, "STT timeout — restarting")
+        scope.launch {
+            stopStt()
+            transitionTo(VoiceState.IDLE)
+            startListening()
+        }
+    }
+
     private suspend fun initService(settings: HermesSettings) {
-        val lang = settings.modelLang
-        val ok = vosk.init(lang)
-        if (!ok) {
-            AppLogger.e(TAG, "Vosk init failed")
+        // Инициализируем выбранный STT
+        val sttOk = when (settings.sttProvider) {
+            "google" -> googleStt?.init(settings.modelLang) ?: false
+            else -> vosk?.init(settings.modelLang) ?: false
+        }
+        if (!sttOk) {
+            AppLogger.e(TAG, "STT init failed for provider: ${settings.sttProvider}")
             transitionTo(VoiceState.ERROR)
             return
         }
@@ -135,19 +161,28 @@ class VoiceService : Service() {
             return
         }
         transitionTo(VoiceState.LISTENING)
-        AppLogger.i(TAG, "Starting free-form listening")
+        val settings = currentSettings ?: return
+        AppLogger.i(TAG, "Starting listening (STT: ${settings.sttProvider})")
 
         listenJob = scope.launch {
             mutex.withLock {
-                vosk.startFreeForm()
+                when (settings.sttProvider) {
+                    "google" -> googleStt?.startListening(settings.modelLang)
+                    else -> vosk?.startFreeForm()
+                }
             }
         }
+    }
+
+    private fun stopStt() {
+        vosk?.stop()
+        googleStt?.stop()
     }
 
     fun updateSettings(settings: HermesSettings) {
         currentSettings = settings
         hermesClient = HermesClient(settings.serverUrl, settings.apiKey)
-        AppLogger.i(TAG, "Settings updated: server=${settings.serverUrl}, lang=${settings.modelLang}")
+        AppLogger.i(TAG, "Settings updated: stt=${settings.sttProvider}, tts=${settings.ttsProvider}")
     }
 
     private fun handleFinalResult(text: String) {
@@ -160,12 +195,12 @@ class VoiceService : Service() {
             if (text.isNotBlank() && text.length > 1) {
                 AppLogger.i(TAG, "Recognized text, sending to Hermes")
                 _messages.value = _messages.value + ChatMessage("user", text)
-                vosk.stop()
+                stopStt()
                 sendToHermes(text)
             } else {
                 AppLogger.w(TAG, "Empty/too short result, restarting")
                 scope.launch {
-                    mutex.withLock { vosk.stop() }
+                    stopStt()
                     transitionTo(VoiceState.IDLE)
                     startListening()
                 }
@@ -180,23 +215,34 @@ class VoiceService : Service() {
         scope.launch(Dispatchers.IO) {
             try {
                 val client = hermesClient ?: throw Exception("Hermes client not initialized")
+                val settings = currentSettings ?: throw Exception("No settings")
 
                 transitionTo(VoiceState.SPEAKING)
-                val fullResponse = client.chatStream(prompt) { token ->
-                    tts.feedToken(token)
-                }
-                tts.flush()
 
-                if (fullResponse.isNotBlank()) {
-                    _messages.value = _messages.value + ChatMessage("assistant", fullResponse)
+                if (settings.ttsProvider == "edge") {
+                    // Edge TTS: ждём полный ответ, потом синтезируем
+                    val fullResponse = client.chat(prompt)
+                    if (fullResponse.isNotBlank()) {
+                        _messages.value = _messages.value + ChatMessage("assistant", fullResponse)
+                        edgeTts?.speak(fullResponse, settings.modelLang)
+                    }
+                    AppLogger.i(TAG, "Hermes response: ${fullResponse.take(100)}…")
+                } else {
+                    // Android TTS: streaming
+                    val fullResponse = client.chatStream(prompt) { token ->
+                        androidTts?.feedToken(token)
+                    }
+                    androidTts?.flush()
+                    if (fullResponse.isNotBlank()) {
+                        _messages.value = _messages.value + ChatMessage("assistant", fullResponse)
+                    }
+                    AppLogger.i(TAG, "Hermes response: ${fullResponse.take(100)}…")
                 }
-
-                AppLogger.i(TAG, "Hermes response: ${fullResponse.take(100)}…")
 
             } catch (e: Exception) {
                 AppLogger.e(TAG, "Hermes request failed: ${e.message}")
                 _messages.value = _messages.value + ChatMessage("assistant", "Ошибка: ${e.message}")
-                tts.speak("Произошла ошибка при обращении к серверу.")
+                androidTts?.speak("Произошла ошибка при обращении к серверу.")
                 transitionTo(VoiceState.ERROR)
                 delay(2000)
                 transitionTo(VoiceState.IDLE)
@@ -258,8 +304,10 @@ class VoiceService : Service() {
         Log.i(TAG, "Service destroyed")
         wakeLock?.release()
         wakeLock = null
-        vosk.close()
-        tts.shutdown()
+        vosk?.close()
+        googleStt?.close()
+        androidTts?.shutdown()
+        edgeTts?.shutdown()
         scope.cancel()
         super.onDestroy()
     }
