@@ -115,7 +115,8 @@ class VoiceService : Service() {
         tts = TtsManager(this)
         tts.onDone = {
             if (_state.value == VoiceState.SPEAKING) {
-                AppLogger.i(TAG, "TTS done → LISTENING again")
+                AppLogger.i(TAG, "TTS done → IDLE → LISTENING")
+                transitionTo(VoiceState.IDLE)
                 startListening()
             }
         }

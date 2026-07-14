@@ -4,6 +4,7 @@ import android.content.Context
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.util.Log
+import com.nous.hermesvoice.util.AppLogger
 import java.util.Locale
 import java.util.UUID
 
@@ -12,6 +13,8 @@ import java.util.UUID
  *
  * Озвучивает текст по предложениям — чтобы начать говорить как только
  * первая фраза готова (в streaming-режиме), не дожидаясь полного ответа.
+ *
+ * Буферизирует токены, если TTS ещё не инициализировался.
  */
 class TtsManager(context: Context) {
 
@@ -19,6 +22,8 @@ class TtsManager(context: Context) {
     private var ready = false
     private var activeUtterances = 0
     private var currentSentence = StringBuilder()
+    // Буфер на случай, если TTS ещё не готов
+    private val pendingTokens = mutableListOf<String>()
 
     var onDone: (() -> Unit)? = null
 
@@ -31,7 +36,18 @@ class TtsManager(context: Context) {
                     val result = tts.setLanguage(locale)
                     ready = result != TextToSpeech.LANG_MISSING_DATA &&
                             result != TextToSpeech.LANG_NOT_SUPPORTED
-                    Log.i(TAG, "TTS ready=$ready, lang=$locale")
+                    AppLogger.i(TAG, "TTS ready=$ready, lang=$locale")
+
+                    // Воспроизводим накопленные токены
+                    if (ready && pendingTokens.isNotEmpty()) {
+                        AppLogger.i(TAG, "Playing ${pendingTokens.size} buffered tokens")
+                        synchronized(this) {
+                            for (token in pendingTokens) {
+                                processToken(token)
+                            }
+                            pendingTokens.clear()
+                        }
+                    }
 
                     tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                         override fun onStart(utteranceId: String?) {}
@@ -60,7 +76,7 @@ class TtsManager(context: Context) {
                     })
                 }
             } else {
-                Log.e(TAG, "TTS init failed: $status")
+                AppLogger.e(TAG, "TTS init failed: $status")
             }
         }
     }
@@ -70,6 +86,7 @@ class TtsManager(context: Context) {
      */
     fun speak(text: String) {
         if (!ready || text.isBlank()) {
+            if (!ready) AppLogger.w(TAG, "TTS not ready yet, speak() ignored")
             onDone?.invoke()
             return
         }
@@ -83,27 +100,37 @@ class TtsManager(context: Context) {
     }
 
     /**
-     * Streaming-озвучка: принимает токены по мере поступления,
-     * озвучивает по готовности предложения (разделитель — . ! ? …).
+     * Streaming-озвучка: принимает токены по мере поступления.
+     * Если TTS ещё не готов — буферизирует.
      */
     fun feedToken(token: String) {
-        if (!ready) return
+        if (!ready) {
+            // Буферизируем до готовности
+            synchronized(this) {
+                pendingTokens.add(token)
+            }
+            return
+        }
         synchronized(this) {
-            currentSentence.append(token)
-            val text = currentSentence.toString()
+            processToken(token)
+        }
+    }
 
-            // Проверяем — заканчивается ли на разделитель предложения
-            val sentenceEnd = text.lastIndexOfAny(charArrayOf('.', '!', '?', '…', '\n'))
-            if (sentenceEnd >= 0) {
-                val sentence = text.substring(0, sentenceEnd + 1).trim()
-                val rest = text.substring(sentenceEnd + 1)
-                currentSentence = StringBuilder(rest)
+    private fun processToken(token: String) {
+        currentSentence.append(token)
+        val text = currentSentence.toString()
 
-                if (sentence.isNotEmpty()) {
-                    activeUtterances++
-                    val utteranceId = UUID.randomUUID().toString()
-                    tts?.speak(sentence, TextToSpeech.QUEUE_ADD, null, utteranceId)
-                }
+        // Проверяем — заканчивается ли на разделитель предложения
+        val sentenceEnd = text.lastIndexOfAny(charArrayOf('.', '!', '?', '…', '\n'))
+        if (sentenceEnd >= 0) {
+            val sentence = text.substring(0, sentenceEnd + 1).trim()
+            val rest = text.substring(sentenceEnd + 1)
+            currentSentence = StringBuilder(rest)
+
+            if (sentence.isNotEmpty()) {
+                activeUtterances++
+                val utteranceId = UUID.randomUUID().toString()
+                tts?.speak(sentence, TextToSpeech.QUEUE_ADD, null, utteranceId)
             }
         }
     }
@@ -113,6 +140,14 @@ class TtsManager(context: Context) {
      */
     fun flush() {
         synchronized(this) {
+            // Если ещё не готов — просто очищаем буфер
+            if (!ready) {
+                AppLogger.w(TAG, "TTS not ready, flushing pending buffer")
+                pendingTokens.clear()
+                currentSentence.clear()
+                onDone?.invoke()
+                return
+            }
             val rest = currentSentence.toString().trim()
             currentSentence.clear()
             if (rest.isNotEmpty()) {
@@ -127,6 +162,7 @@ class TtsManager(context: Context) {
         synchronized(this) {
             activeUtterances = 0
             currentSentence.clear()
+            pendingTokens.clear()
         }
         tts?.stop()
     }
@@ -140,6 +176,6 @@ class TtsManager(context: Context) {
 
     companion object {
         private const val TAG = "TtsManager"
-        private const val isRussian = true // TODO: настраивать из Settings
+        private const val isRussian = true
     }
 }
