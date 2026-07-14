@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Hermes Voice</string>
+    <string name="notif_channel">Hermes Voice Service</string>
+    <string name="notif_title">Hermes Voice</string>
+    <string name="notif_listening">🎤 Слушаю…</string>
+    <string name="notif_thinking">🧠 Думаю…</string>
+    <string name="notif_speaking">🔊 Говорю…</string>
+    <string name="notif_idle">🔇 Ожидание wake word</string>
+</resources>

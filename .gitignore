@@ -1,0 +1,11 @@
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+.DS_Store
+*.apk
+*.aab
+app/src/main/assets/models/
+ANALYSIS*.md
+REQUEST_*.txt
